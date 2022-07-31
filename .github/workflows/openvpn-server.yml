@@ -1,0 +1,222 @@
+name: OpenVPN Server
+
+on:
+  - push
+
+concurrency:
+  group: openvpn
+  cancel-in-progress: true
+
+# General workflow overview:
+#  1. The client pushes git changes with top commit in a specific format,
+#     containing the client's IP address, mapped external port and local
+#     source port. The mapping is detected with stun client from run.sh
+#     script.
+#  2. This Action workflow is started on git push, checks the commit message
+#  3. Continue the flow if commit message contains "OVPN: "
+#  4. Extract client's IP address, mapped port and local source port from
+#     the commit message
+#  5. Run STUN client using UDP source port 443 to determine server's external
+#     IP address and NAT-mapped port for UDP source port 443.
+#  6. Run UDP NAT punch from source port 443 to client's IP address and mapped
+#     port with nping in the background
+#  7. Run OpenVPN on UDP port 443
+
+jobs:
+  openvpn-server:
+    name: OpenVPN Server
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v3
+        with:
+          fetch-depth: 0
+
+      # Execute this job only if the commit message starts with "OVPN: " string.
+      # GitHub actions workflow does not have any native way to run job only for
+      # specific commit messages.
+      - name: 'Check if commit message starts with "OVPN: "'
+        id: check
+        run: >
+          [[ "$(git log --pretty='%s' -n1)" =~ "OVPN: " ]]
+          && echo "::set-output name=run::true" || true
+
+      # Extract IP address, external source port and local port of the client
+      # from the top git commit message.
+      # The message format is as follows:
+      #
+      #  OVPN: 198.51.100.123:5555:8888
+      #
+      # where 198.51.100.123 is the client's external IP address,
+      # 5555 is an external port (after NAT mapping if the client is behind NAT),
+      # 8888 is a client's source port (before NAT).
+      # If the client is not behind NAT or is behind port-preserving NAT, both
+      # ports would be the same.
+      # The mapped port is determined with stun client on the client side,
+      # check run.sh code.
+      #
+      # If the client did not specify ports in the commit message, the server
+      # will choose random local port for the client. Such connection would
+      # work only if the client is behind port-preserving NAT or no NAT, as
+      # otherwise the server won't know the relation between source port and
+      # mapped port.
+      #
+      # Only IPv4 is supported since Actions worker does not have IPv6 connectivity.
+      - name: Get client IP address and optional port from commit title
+        if: ${{ steps.check.outputs.run }}
+        id: user
+        run: >
+          IP="$(git log --pretty='%s' -n1 | awk '{split($2, a, /:/);print a[1]}')"
+          && PORT="$(git log --pretty='%s' -n1 | awk -F ':' '{print $3}')"
+          && LPORT="$(git log --pretty='%s' -n1 | awk -F ':' '{print $4}')"
+          && { [[ ! "$PORT" ]] && PORT=$(( $RANDOM + 32767 )) || true; }
+          && { [[ ! "$LPORT" ]] && LPORT=$PORT || true; }
+          && echo "Client IP address: $IP"
+          && echo "Client port (after NAT mapping): $PORT"
+          && echo "Client port (before NAT mapping): $LPORT"
+          && echo "::set-output name=ip::$IP"
+          && echo "::set-output name=port::$PORT"
+          && echo "::set-output name=lport::$LPORT"
+
+      - name: Install packages and configure system
+        if: ${{ steps.check.outputs.run }}
+        run: >
+          sudo rm /var/lib/man-db/auto-update
+          && sudo DEBIAN_FRONTEND=noninteractive eatmydata
+          apt install -y --no-install-recommends openvpn openssh-server stun-client nmap
+          && ([ -f authorized_keys ] && cat authorized_keys | sudo tee /root/.ssh/authorized_keys || true)
+
+      # Use STUN client with Google's STUN server to detect external IP address and mapped NAT port
+      # for source port 443 (used by OpenVPN/WireGuard server).
+      #
+      # Actions worker is running behind the following type of NAT, according to STUN client:
+      #
+      #  Independent Mapping, Port Dependent Filter, random port, will hairpin
+      #
+      # What matters for us is:
+      #
+      #  * Independent Mapping — read it as "NAT mapping independent of destination host/port".
+      #
+      #    The NAT would map any request to the same mapped port coming from the same local port,
+      #    regardless of destination IP address or destination port.
+      #    In other words, requests
+      #    from 192.168.0.10:5555 to 1.1.1.1:80
+      #    would be mapped to the same NAT external address and port as the requests
+      #    from 192.168.0.10:5555 to 8.8.8.8:443
+      #
+      #  * Random port — read it as "non-source-port-preserving NAT"
+      #
+      #    Some type of NATs preserve the source port for NAT mapping wherever possible, i.e.
+      #    192.168.0.10:5555 would be mapped to 198.51.100.123:5555 (both source ports are 5555).
+      #    However, Actions infrastructure NAT does not preserve the port, meaning that the
+      #    source port will be mapped to another port. In Actions case, the mapping is done
+      #    in sequence, starting from port 1024 or 1984 (yes, really).
+      #    For example, if you send the request
+      #    from 192.168.0.10:5555 to 1.1.1.1:80, your 192.168.0.10:5555 would be
+      #    mapped to 198.51.100.123:1024.
+      #    The next request
+      #    from 192.168.0.10:9876 to 1.1.1.1:80 would be mapped to 198.51.100.123:1025,
+      #    and so on.
+      #    The exact pattern of port mapping is not relevant for NAT traversal as long as it is
+      #    Independent Mapping, it is only important that the port is not preserved, which forces
+      #    us to determine the mapping using external services like STUN server.
+      #
+      #    If it were port-preserving, there wouldn't be any need to determine port mapping.
+      #    But since it's non-port-preserving, we'll determine the mapping for source port 443,
+      #    which would be used to run OpenVPN/WireGuard later.
+      #
+      #  * Port Dependent Filter — read it as "NAT allows incoming packets only from single IP AND port"
+      #
+      #    This type of NAT, when the packet is sent from exact source IP/port to exact destination IP/port,
+      #    accepts incoming packets only from this exact destination IP/port.
+      #    This is the most common type of filter.
+      #
+      #    If it were Independent Filter, there wouldn't be any need to send client's IP address and port to
+      #    the server in the git commit message: NAT accepts incoming packets from any IP and port in such case.
+      #
+      #  * Will hairpin
+      #    Hairpinning (NAT loopback) matters only for connectivity behind the same router and
+      #    is irrelevant for internet-wide NAT traversal.
+      #
+      # NOTE: use stun.ekiga.net or other STUN server with multiple IP addresses to properly detect NAT type.
+      # Google's stun.l.google.com server has only single IP address and won't allow to run mapping type test
+      # properly, leading to incorrect/confusing results. This does not matter for port mapping, but it does
+      # matter for NAT type information.
+      - name: Detect IP address and UDP port mapping
+        if: ${{ steps.check.outputs.run }}
+        id: ip
+        run: >
+          sudo stun -v stun.l.google.com:19302 -p 443 1 2>&1 | awk '/MappedAddress/ {
+          split($0, aport, /:/); split(aport[1], aip, / /); port=aport[2]; ip=aip[3];
+          print "Server IP address:", ip, "\n::set-output name=ip::"ip;
+          print "Server port map for source port 443:", port, "\n::set-output name=port::"port;
+          exit}'
+
+      # Punch NAT by sending empty UDP packets to the client's IP address and mapped port
+      # from source (non-mapped) port 443 (used by OpenVPN/WireGuard later).
+      # The packet would be mapped to the same external port as with stun client in
+      # the previous step.
+      # We send the packets every 28 seconds to keep the port mapping active, otherwise
+      # it could be forgotten and/or remapped to another NAT port, which would
+      # break the traversal. This is only relevant before the client gets connected
+      # to the VPN, as both OpenVPN and WireGuard have keep-alive intervals
+      # doing essentially the same — keeping NAT mapping active.
+      # Typical "not established" UDP session timeout is 30 seconds, hence 28 seconds
+      # interval.
+      # Empty packets do not have any effect on VPN connection when it is already
+      # established, that's why we don't need to terminate nping upon connection.
+      #
+      # Note important detail here: the packet is sent with low Time-To-Live value of 4,
+      # to be able to punch the Actions NAT but prevent the packet from getting delivered
+      # to the client. Why is this important, you may ask?
+      # Because a very common Linux NAT (mis)configuration would create and remember
+      # NAT mapping upon receiving incoming UDP packet (so-called "null binding"),
+      # which in turn would prevent the client behind said NAT to reuse the same source
+      # port, and nothing would work.
+      # Check https://www.spinics.net/lists/netfilter/msg58232.html for more information.
+      # If you're writing NAT traversal in your software, TTL could be set with setsockopt
+      # per-socket and does not require root privileges in Linux.
+      #
+      # As port 443 would be occupied by OpenVPN later in the workflow sequence, nping
+      # is started with sudo here: in such configuration it uses RAW sockets and
+      # bypasses regular Linux UDP stack, resolving any conflicts with port usage,
+      # although that's not the only way to resolve port sharing conflict and it is
+      # possible to bind to the same port from different programs with SO_REUSEPORT
+      # socket option without root privileges.
+      - name: Punch NAT towards client IP address for 10 minutes (in background)
+        if: ${{ steps.check.outputs.run }}
+        run: >
+          sudo nping --udp --ttl 4 --no-capture --source-port 443 --count 20 --delay 28s
+          --dest-port ${{ steps.user.outputs.port }} ${{ steps.user.outputs.ip }} &
+
+      ## Uncomment to connect to ssh-j.com service, for debugging using SSH
+      ## outside of VPN tunnel, if the tunnel can't be established.
+      ##
+      ## Connect with:
+      ##  ssh -J yourloginhere@ssh-j.com root@github
+      ##
+      #- name: Connect to ssh-j
+      #  if: ${{ steps.check.outputs.run }}
+      #  run: >
+      #    ssh -f -o StrictHostKeyChecking=accept-new -o ExitOnForwardFailure=yes
+      #    yourloginhere@ssh-j.com -N -R github:22:localhost:22
+
+      # Client OpenVPN configuration does not contain server IP address and port.
+      # Server IP, port and the local port should be used by client is supplied
+      # with additional command line arguments.
+      - name: Print OpenVPN connection string
+        if: ${{ steps.check.outputs.run }}
+        run: |
+          echo Run:
+          echo sudo openvpn --config client.ovpn \
+          --remote ${{ steps.ip.outputs.ip }} --rport ${{ steps.ip.outputs.port }} \
+          --lport ${{ steps.user.outputs.lport }}
+          echo
+          echo "Connect to the server's SSH with: ssh root@192.168.166.1"
+
+      # OpenVPN is configured to run on UDP port 443 in the configuration file.
+      - name: Run OpenVPN
+        if: ${{ steps.check.outputs.run }}
+        timeout-minutes: 15
+        run: >
+          sudo openvpn --config server.ovpn
