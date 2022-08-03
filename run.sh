@@ -69,9 +69,11 @@ echo ">>> Now check GitHub Actions job 'OpenVPN connection string' or 'WireGuard
 # The 3.3.3.3 IP address here is in non-routed IP address space, the packets
 # would punch NAT but won't be delivered anywhere.
 # The port 443 here was chosen without any strong reason. It does not matter
-# for "Independent Mapping" NAT, but out VPN uses this port, so
-# send the packets for this exact port, just in case if there's someone
-# who implemented "port, but not address-dependent mapping" NAT.
+# for "Independent Mapping" NAT. We may have used ports 1024 or 1984 here
+# (two most common external port mappings in Actions for the first outgoing
+# request), just in case if there's someone who implemented
+# "port, but not address-dependent mapping" NAT. But for now, let it be just
+# 443.
 #
 # Short interval of 10 seconds is used to prevent the case when the client
 # press CTRL+C very close to NAT mapping expiration timeout, but not starting

@@ -135,6 +135,7 @@ jobs:
       #    the server in the git commit message: NAT accepts incoming packets from any IP and port in such case.
       #
       #  * Will hairpin
+      #
       #    Hairpinning (NAT loopback) matters only for connectivity behind the same router and
       #    is irrelevant for internet-wide NAT traversal.
       #

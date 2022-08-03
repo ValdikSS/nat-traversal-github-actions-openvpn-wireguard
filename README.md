@@ -56,14 +56,14 @@ You will be able to connect to WireGuard/OpenVPN server running on your Actions 
 
 Yes, you can connect to it if you're behind the most common NAT with "Independent Mapping" characteristics, either port-preserving or non-port-preserving (random port).
 
-#### ‣ Independent mapping? Port preserving? I know only Cone and Symmetric NAT!
-
-The cone/port-restricted/symmetric NAT nomenclature is confusing and does not describe the NAT type precisely.  
-For example, Actions worker NAT is somewhere between port-restricted and symmetric: it has port-dependent filtering, but also does not preserve the source port.
-
 `run.sh` script will do everything for you, including NAT type identification.
 
-*For more information, refer to [RFC4787](https://datatracker.ietf.org/doc/html/rfc4787) and [RFC5128](https://datatracker.ietf.org/doc/html/rfc5128)*
+#### ‣ Independent mapping? Port preserving? I know only Cone and Symmetric NAT!
+
+The cone/port-restricted/symmetric NAT nomenclature is a bit outdated and does not describe all the NAT types found on the real Internet precisely.  
+Actions worker is placed after port-restricted NAT (which also does not preserve the source port).
+
+*For NAT type identification, refer to [RFC4787](https://datatracker.ietf.org/doc/html/rfc4787) and [RFC5128](https://datatracker.ietf.org/doc/html/rfc5128)*
 
 #### ‣ Where can I get more information?
 
